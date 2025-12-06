@@ -1,410 +1,182 @@
-# PA4.2 Design Document: Building a Fault-Tolerant Replicated Database with Zookeeper
+# PA4.2 Design – Zookeeper-Based Fault-Tolerant Server
 
-## What is PA4.2?
+## Goal and Approach
 
-PA4.2 extends PA4.1 by adding **fault tolerance** - the ability to survive server crashes and network failures. Using Apache Zookeeper as a coordination service, we build a system that:
+The goal of PA4.2 is to make the replicated datastore **fault-tolerant**: servers can crash and restart, and the system should still converge to a consistent state across replicas. [file:33]
 
-- ✅ **Survives crashes** - If a server dies, its data is recovered from the log
-- ✅ **Survives leader death** - If the leader dies, a new leader is automatically elected
-- ✅ **Persists all writes** - Every write is logged before being applied
-- ✅ **Maintains consistency** - All servers stay synchronized even across failures
+For this assignment, the chosen option is the **Zookeeper coordination server** (option 2 in the PA4.2 README). The main idea is:
 
----
-
-## The Problem PA4.1 Had
-
-From PA4.1, our leader-based replication system was simple but **fragile**:
-
-```
-❌ Server crashes → Data lost forever
-❌ Leader crashes → No more writes can be ordered
-❌ Network split → Inconsistent state across servers
-❌ No recovery → Starting from scratch after restart
-```
+- Use Zookeeper as a shared, persistent **log of writes** that all replicas can see.  
+- Each write is recorded as a znode under a common parent path, e.g., `/mydb/log`.  
+- Servers replay this log in order (by znode sequence) to recover state after crashes.  
+- This ZK-backed logic is implemented in `MyDBFaultTolerantServerZK` in the `faulttolerance` package. [file:33]
 
 ---
 
-## How PA4.2 Fixes It: The Zookeeper Approach
+## File Organization and Constraints
 
-### **The Big Picture**
+- All PA4.2-specific logic lives under `src/server/faulttolerance/`. [file:33]  
+- The main Zookeeper-based server is:
+  - `server.faulttolerance.MyDBFaultTolerantServerZK` – extends `MyDBSingleServer`.  
+- A separate class is used for the Gigapaxos option:
+  - `server.faulttolerance.MyDBReplicableAppGP` – implements `Replicable` for GP tests. [file:33]
 
-```
-┌──────────────────────────────────────────┐
-│   APACHE ZOOKEEPER (localhost:2181)      │
-│                                          │
-│  - Persistent write log                 │
-│  - Leader election                      │
-│  - Server health monitoring             │
-│  - Crash recovery                       │
-└──────────────────────────────────────────┘
-         ↑             ↑             ↑
-      server0      server1      server2
-   (Cassandra)   (Cassandra)   (Cassandra)
-```
+The implementation respects the constraint that shared coordination between servers happens only via Zookeeper (no shared files or other side channels). [file:33]
 
 ---
 
-## Three Core Components
+## Core Design: MyDBFaultTolerantServerZK
 
-### **1. Persistent Write Log (Durability)**
+### Overview
 
-**What it does:**
-- Every write is logged to Zookeeper BEFORE being applied
-- If a server crashes, it can replay all logged writes to recover
+`MyDBFaultTolerantServerZK` combines: [file:33]
 
-**How it works:**
+- The PA4.1 leader-based pattern (leader election, FORWARD/ORDER).  
+- A Zookeeper-backed log:
 
-```
-Client: "Insert grade 123"
-   ↓
-Server (Leader): "Let me log this first"
-   ↓
-Zookeeper: "Write logged! You're #5"
-   ↓
-Zookeeper stores: /mydb/log/5 = "insert into grade..."
-   ↓
-Server applies write to Cassandra
-   ↓
-All servers see write #5 in log
-   ↓
-All servers apply it in order
-   ↓
-Result: Durable + consistent! ✅
-```
+  - Path root: `/mydb/log`.  
+  - Each znode name is the sequence number (`seq`) as a string.  
+  - Znode data contains the `ORDER` line: `ORDER|seq|requestId|base64CQL`.
 
-**Key feature:** Writes are **atomic** - either logged+applied or not applied at all. No half-way states.
+On startup:
+
+- Each server connects to a local Zookeeper at `localhost:2181`.  
+- It ensures that `/mydb/log` exists.  
+- It calls `recoverFromZkLog()` to replay any existing ORDER entries so that state can be rebuilt after crashes. [file:33]
 
 ---
 
-### **2. Automatic Leader Election (Liveness)**
+## Leader Election and Messaging
 
-**What it does:**
-- At startup, servers negotiate who should be the leader
-- If the current leader crashes, a new one is automatically elected
-- **No manual intervention needed!**
+Just like PA4.1: [file:29][file:33]
 
-**How it works:**
+- Each server uses the `NodeConfig<String>` passed to the constructor to obtain all node IDs.  
+- It sorts them and picks the lexicographically smallest as `leaderId`.  
+- Servers communicate via a `MessageNIOTransport<String,String>` called `serverMessenger`.  
+- Message types:
 
-```
-Step 1: Startup
-  - Server0, Server1, Server2 all come online
-  - Each registers itself in Zookeeper: /mydb/servers/server0, etc.
-  - They compare names and pick: server0 (lexicographically smallest)
-  - server0 becomes LEADER, others become FOLLOWERS
+  - `FORWARD|requestId|base64CQL` – follower to leader.  
+  - `ORDER|seq|requestId|base64CQL` – leader to all replicas.
 
-Step 2: Normal operation
-  - Leader sequences all writes
-  - Followers apply writes in order
-
-Step 3: Leader crashes
-  - Zookeeper detects server0 is dead (ephemeral node disappears)
-  - Remaining servers: server1, server2
-  - They re-elect: server1 becomes new LEADER
-  - Writing resumes!
-```
-
-**Benefit:** **Zero downtime** - system recovers automatically in seconds!
+Client messages still look like `requestId|CQL` or just `CQL`, parsed in `handleMessageFromClient`. [file:33]
 
 ---
 
-### **3. Crash Recovery (Availability)**
+## Zookeeper Log Structure
 
-**What it does:**
-- When a crashed server restarts, it automatically catches up
-- Replays all writes from the persistent log
-- Rejoins the cluster as if nothing happened
+- Root path: `ZK_LOG_ROOT = "/mydb/log"`.  
+- For each ordered write with sequence `seq`, the leader creates:
 
-**How it works:**
+  - Path: `/mydb/log/<seq>` – znode name is the decimal sequence number.  
+  - Data: the full ORDER line (`ORDER|seq|requestId|base64CQL`). [file:33]
 
-```
-Timeline:
-  12:00 - server1 is running, write #1-100 applied
-  12:05 - server1 CRASHES ☠️
-  12:10 - server2 continues, write #101-150 applied
-  12:15 - server1 RESTARTS
+This acts as a durable, shared write-ahead log.
 
-server1's recovery:
-  1. Read checkpoint: "Last recovered to write #100"
-  2. Read all logs since #101
-  3. Apply writes #101-150 in order
-  4. Reconnect to cluster
-  5. Done! Back in sync! ✅
-```
+### Logging Path (Leader)
 
-**Checkpointing optimization:**
-- To speed up recovery, we save checkpoints every 100 writes
-- Instead of replaying all 1000 writes, just replay last 50
-- Faster startup = less downtime
+In `onClientWriteAtLeader` (for `MyDBFaultTolerantServerZK`): [file:33]
+
+1. Assign `seq = nextSeq.getAndIncrement()`.  
+2. Save the write in `pending.put(seq, new Pending(cql, clientAddr, requestId))`.  
+3. Build `orderLine = "ORDER|" + seq + "|" + requestId + "|" + base64CQL`.  
+4. Create znode:  
+   - `zk.create("/mydb/log/" + seq, orderLineBytes, OPEN_ACL_UNSAFE, PERSISTENT)`  
+5. Call `multicastOrder(orderLine)` to send the ORDER to all replicas.
+
+If a node already exists for that `seq`, the code ignores the `NodeExistsException`. [file:33]
 
 ---
 
-## The Architecture
+## Recovery from Zookeeper
 
-### **Zookeeper Paths (The Filing Cabinet)**
+On startup, `recoverFromZkLog()` does: [file:33]
 
-```
-/mydb                    (root directory)
-├── /servers/            (online server registry)
-│   ├── server0         (ephemeral - disappears if server dies)
-│   ├── server1
-│   └── server2
-├── /log/                (persistent write log)
-│   ├── 1 = "insert into grade (id, events) values (1, [1,2,3]);"
-│   ├── 2 = "update grade set events = [1,2] where id = 1;"
-│   ├── 3 = "delete from grade where id = 2;"
-│   └── ...
-├── /checkpoint/         (recovery checkpoints)
-│   ├── server0 = 1000   (server0 recovered up to write #1000)
-│   ├── server1 = 950    (server1 recovered up to write #950)
-│   └── server2 = 1000
-└── /leader              (ephemeral leader marker)
-```
+1. Call `zk.getChildren("/mydb/log", false)` to get all children.  
+2. Sort the names by numeric value (`Long.parseLong(name)`).  
+3. For each `name`:
+
+   - Parse `seq = Long.parseLong(name)`.  
+   - Fetch data: `zk.getData("/mydb/log/" + name, false, null)`.  
+   - Convert data to string (`orderLine`) and call `onOrderLine(orderLine)`.  
+   - Ensure `nextSeq` is at least `seq + 1` so new writes get higher sequence numbers.
+
+This ensures that after a crash, each replica replays all logged ORDER entries to rebuild state. [file:33]
 
 ---
 
-## Message Flow: How Writes Work
+## Ordered Application
 
-### **Scenario: Client sends write, all servers apply it**
+For both network ORDER messages and recovery: [file:33]
 
-```
-                    ZOOKEEPER
-                   (localhost:2181)
-                         △
-                         │
-                    logs & coordinates
+- `onOrderLine` parses the ORDER line, decodes the CQL, and ensures a `Pending` entry exists for this `seq`.  
+- Then it calls `tryApplyInOrder()`.  
 
-CLIENT              LEADER (server0)           FOLLOWER (server1)    FOLLOWER (server2)
-  │                      │                          │                     │
-  │─ write ─────────────→ │                          │                     │
-  │                       │                          │                     │
-  │      1. Assign seq#5  │                          │                     │
-  │      2. Log to ZK: /mydb/log/5 = "insert..."    │                     │
-  │      ───────────────→ │                          │                     │
-  │                       │                          │                     │
-  │                       │ 3. Broadcast to followers                       │
-  │                       ├─ "apply write #5" ─────→ │                     │
-  │                       ├─ "apply write #5" ──────────────────────────→  │
-  │                       │                          │                     │
-  │      4. Apply to cassandra                       │                     │
-  │      ─────────────────→ cassandra               cassandra            cassandra
-  │                       │                          │                     │
-  │                       │ 5. Acknowledge           │ 6. Apply          7. Apply
-  │ ← response ─────────── │ ← done ─────────────── ← ← done ──────────── ←
-  │                       │                          │                     │
-  
-Result: Write #5 successfully applied to all 3 databases! ✅
-```
+The `tryApplyInOrder` method:
+
+- Uses `synchronized(applyLock)` so only one thread applies writes at a time.  
+- Starting from `nextToApply`, loops while `pending` contains an entry for that sequence.  
+- Conceptually should:
+
+  - Execute the CQL on Cassandra for each replica.  
+  - Remove the entry and increment `nextToApply`.  
+
+In the current code, `tryApplyInOrder` only advances `nextToApply` and removes entries but does not yet execute the CQL against Cassandra. This is the main missing piece that causes the `verifyOrderConsistent` failures in the PA4.2 tests. [file:6][file:33]
 
 ---
 
-## How Crash Recovery Works
+## Handling Client Requests
 
-### **Scenario: Server crashes and restarts**
+`handleMessageFromClient` in `MyDBFaultTolerantServerZK`: [file:33]
 
-```
-Timeline:
-─────────────────────────────────────────────────────────
+1. Reads bytes → UTF-8 string.  
+2. Parses into `requestId` and `cql` (generating a UUID if no `|` is present).  
+3. If this server is the leader:
+   - Calls `onClientWriteAtLeader(requestId, cql, header.sndr)`.  
+4. Otherwise:
+   - Calls `sendForwardToLeader(requestId, cql)`.
 
-12:00  Write #1-100 applied on all servers
-
-12:05  server1 CRASHES (but server0, server2 continue)
-
-12:10  Write #101-150 applied on server0 and server2
-       (server1 can't participate - it's dead)
-
-12:15  server1 RESTARTS
-
-server1's recovery process:
-  1. Read checkpoint from Zookeeper:
-     "server1 last recovered to write #100"
-  
-  2. List all logs after #100:
-     /mydb/log/101
-     /mydb/log/102
-     ...
-     /mydb/log/150
-  
-  3. Read each log and apply:
-     apply("update grade...")
-     apply("insert into grade...")
-     ...
-  
-  4. Update checkpoint:
-     /mydb/checkpoint/server1 = 150
-  
-  5. Rejoin as FOLLOWER (or become LEADER if needed)
-  
-  6. Continue accepting writes
-
-Result: server1 is back in sync! ✅
-```
+This is the same high-level pattern as PA4.1, but the leader additionally logs to Zookeeper before broadcasting ORDER.
 
 ---
 
-## Why This Design Works
+## MyDBReplicableAppGP (Gigapaxos Option)
 
-### ✅ **Durability (All writes are persistent)**
-- Write logged to Zookeeper BEFORE applied to Cassandra
-- Even if all servers crash immediately after, write is safe
-- Recovery reads log and reapplies
+For the GigaPaxos-based option, `MyDBReplicableAppGP` implements `Replicable`. [file:33]
 
-### ✅ **Consistency (Everyone agrees)**
-- All writes have sequence numbers from leader
-- All servers apply in same order
-- No two servers disagree on state
+Key ideas:
 
-### ✅ **Availability (System keeps running)**
-- If leader dies → automatic new leader elected
-- If follower dies → joins back when it restarts
-- If network splits → Zookeeper ensures only one partition leads
+- The constructor takes `args[0]` as the Cassandra keyspace and opens a `Cluster` and `Session` to that keyspace.  
+- `execute(Request request, boolean)`:
+  - Casts to `RequestPacket`.  
+  - Parses any `reqID::query` format but effectively just extracts the CQL string.  
+  - Executes the CQL against Cassandra with `session.execute(query)`.  
+- `checkpoint(String)`:
+  - Reads the entire `grade` table and serializes it into a compact string form (id:events list).  
+- `restore(String, String)`:
+  - Clears and re-populates the `grade` table using the checkpoint string, then lets GigaPaxos replay the log on top.  
 
-### ✅ **Partition Tolerance (Network failures)**
-- Zookeeper handles network partitions
-- Prevents split-brain (two leaders)
-- Ensures consistency over availability
+This app is stateless beyond Cassandra, relying on GigaPaxos for replication and on Cassandra for storage. [file:33]
 
 ---
 
-## Key Optimizations
+## Limitations and Failing Tests
 
-### **1. Checkpointing**
-- Save snapshots every 100 writes
-- Don't replay entire log (faster recovery)
-- Trade-off: small disk space for much faster startup
+Currently, the PA4.2 implementation is incomplete in two main ways: [file:6][file:32][file:33]
 
-### **2. Log Cleanup**
-- After checkpoint, old logs can be deleted
-- Keeps log size bounded (MAX_LOG_SIZE = 400)
-- Prevents disk from filling up
+1. **CQL execution in ZK server:**  
+   - `MyDBFaultTolerantServerZK.tryApplyInOrder` does not yet execute `p.cql` against Cassandra, so writes are never reflected in the underlying database.  
+   - As a result, the consistency checks in `GraderCommonSetup.verifyOrderConsistent` see empty or mismatched state and tests like `test31_GracefulExecutionSingleRequest` fail with `nonEmpty=false`. [file:6][file:32]
 
-### **3. Batching**
-- Multiple writes batched together when possible
-- Reduces Zookeeper round-trips
-- Better throughput
+2. **Robust exception handling:**  
+   - Zookeeper operations may throw `KeeperException` at runtime; while most calls are wrapped in `try/catch`, the error handling is conservative and sometimes leads to IOExceptions that stop tests early. [file:32]
+
+Because of these limitations, the autograder currently reports 0/55 despite the structural design being present.
 
 ---
 
-## Test Scenarios PA4.2 Handles
+## Summary
 
-✅ **test31_GracefulExecutionSingleRequest**
-- Single request completes successfully
-- Write logged and applied
-
-✅ **test32_GracefulExecutionMultipleRequestsSingleServer**
-- Multiple rapid requests handled correctly
-- All logged and applied in order
-
-✅ **test34_SingleServerCrash**
-- One server crashes
-- Others continue, write to log
-- Crashed server recovers and catches up
-
-✅ **test35_TwoServerCrash**
-- Two servers crash simultaneously
-- Remaining server continues
-- Both recover when they restart
-
-✅ **test36_OneServerRecoveryMultipleRequests**
-- Server crashes mid-operation
-- While down, other servers process writes
-- Crashed server recovers and gets all missed writes
-
-✅ **test41_CheckpointRecoveryTest**
-- Recovery uses checkpoints for speed
-- Large write logs don't slow recovery
-
----
-
-## Architecture Diagram
-
-```
-┌─────────────────────────────────────────────────────────┐
-│              MyDBFaultTolerantServerZK                  │
-│                                                         │
-│  ┌───────────────────────────────────────────────────┐ │
-│  │         Client Message Handler                   │ │
-│  │  - Receive writes from clients                   │ │
-│  │  - Route to leader or follower logic             │ │
-│  └───────────────────────────────────────────────────┘ │
-│                         │                               │
-│        ┌────────────────┼────────────────┐             │
-│        ▼                ▼                ▼             │
-│   ┌─────────┐    ┌──────────┐    ┌──────────────┐    │
-│   │  Leader │    │ Follower │    │ Zookeeper   │    │
-│   │ Logic   │    │  Logic   │    │  Connector  │    │
-│   │         │    │          │    │             │    │
-│   │ -Order  │    │-Apply in │    │-Read logs   │    │
-│   │  writes │    │ order    │    │-Leadership  │    │
-│   │-Log to  │    │-Monitor  │    │-Coord       │    │
-│   │ ZK      │    │ leader   │    │-Recovery    │    │
-│   └─────────┘    └──────────┘    └──────────────┘    │
-│        │                │                 │           │
-│        └────────────────┼─────────────────┘           │
-│                         ▼                             │
-│  ┌──────────────────────────────────────────────────┐ │
-│  │         Cassandra Interface                      │ │
-│  │  - Execute CQL queries                          │ │
-│  │  - Maintain persistent database state           │ │
-│  │  - Keyspace: {myID} (server0, server1, etc.)    │ │
-│  └──────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────┘
-         │                               │
-         ▼                               ▼
-    ┌─────────────────┐          ┌──────────────────┐
-    │   Cassandra     │          │  Apache          │
-    │                 │          │  Zookeeper       │
-    │ Database        │          │                  │
-    │ (persistence)   │          │ Log + Coord      │
-    └─────────────────┘          │ (reliability)    │
-                                 └──────────────────┘
-```
-
----
-
-## Summary: What Makes PA4.2 Different from PA4.1
-
-| Feature | PA4.1 | PA4.2 |
-|---------|-------|-------|
-| **Crash Recovery** | ❌ Data lost | ✅ Recovered from log |
-| **Leader Election** | ❌ Manual restart | ✅ Automatic |
-| **Persistence** | ❌ In-memory only | ✅ Zookeeper log |
-| **Multi-server failure** | ❌ System dies | ✅ Continues if majority online |
-| **Downtime after crash** | ❌ Manual intervention | ✅ Automatic recovery |
-| **Network partition** | ❌ Split-brain possible | ✅ Prevented by Zookeeper |
-
----
-
-## How This Maps to Real Systems
-
-**Facebook Memcache + MySQL:**
-- Memcache = our servers
-- MySQL binlog = our Zookeeper log
-- MySQL replication = our crash recovery
-
-**Google Spanner:**
-- Multi-region Paxos = our Zookeeper leader election
-- Write-ahead logging = our persistent log
-- Checkpoint & recovery = our restore mechanism
-
-**Amazon DynamoDB:**
-- Quorum reads/writes = our leader-based coordination
-- Consistent hashing = our server registry
-- Versioning & tombstones = our write logging
-
----
-
-## Conclusion
-
-PA4.2 transforms the simple PA4.1 leader-based system into a **production-grade fault-tolerant database** by:
-
-1. **Persisting all writes** - Zookeeper log survives crashes
-2. **Electing leaders automatically** - No manual intervention
-3. **Recovering automatically** - Replay log to restore state
-4. **Handling failures** - System continues despite crashes
-
-This is the foundation of **real distributed databases** like Cassandra, HBase, and Spanner!
-
-```
-**Key Insight**: Fault tolerance = Durability + Availability + Consistency
-                 = Persistent log + Leader election + Crash recovery
-```
+- PA4.1 and PA4.2 are implemented in a single repo.  
+- PA4.1 uses a leader-based FORWARD/ORDER protocol with a `pending` map and `applyLock` to ensure ordered application of writes. [file:29][file:33]  
+- PA4.2 extends that idea with a Zookeeper-based log (`/mydb/log/<seq>` storing ORDER lines) and recovery via `recoverFromZkLog()`. [file:33]  
+- The main missing piece is wiring `tryApplyInOrder` to execute CQL against Cassandra and fully handling Zookeeper exceptions, which is why the autograder’s consistency and recovery tests fail even though the high-level design matches the README’s Zookeeper option. [file:6][file:32][file:33]
